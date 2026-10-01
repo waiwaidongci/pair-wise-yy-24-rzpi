@@ -119,6 +119,70 @@ class RadioDB:
               created_at TEXT NOT NULL,
               UNIQUE(air_date, slot_id, kind)
             );
+            CREATE TABLE IF NOT EXISTS stations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              code TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS backhaul_packages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              station_id INTEGER NOT NULL REFERENCES stations(id),
+              package_no TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','accepted','void')),
+              total_segments INTEGER NOT NULL DEFAULT 0,
+              accepted_segments INTEGER NOT NULL DEFAULT 0,
+              pending_segments INTEGER NOT NULL DEFAULT 0,
+              missing_segments INTEGER NOT NULL DEFAULT 0,
+              recalc_round INTEGER NOT NULL DEFAULT 0,
+              void_reason TEXT,
+              voided_at TEXT,
+              received_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(station_id, package_no)
+            );
+            CREATE TABLE IF NOT EXISTS backhaul_segments (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              package_id INTEGER NOT NULL REFERENCES backhaul_packages(id) ON DELETE CASCADE,
+              segment_no INTEGER NOT NULL,
+              slot_id INTEGER REFERENCES slots(id) ON DELETE SET NULL,
+              air_date TEXT NOT NULL,
+              start_time TEXT NOT NULL,
+              region TEXT NOT NULL,
+              actual_start TEXT,
+              actual_duration_minutes INTEGER
+                CHECK(actual_duration_minutes IS NULL OR actual_duration_minutes >= 0),
+              actual_program_id INTEGER REFERENCES programs(id),
+              status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('accepted','pending','missing')),
+              fail_reason TEXT,
+              playout_log_id INTEGER REFERENCES playout_logs(id) ON DELETE SET NULL,
+              snapshot_id INTEGER REFERENCES authorization_snapshots(id) ON DELETE SET NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(package_id, segment_no)
+            );
+            CREATE TABLE IF NOT EXISTS authorization_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              station_id INTEGER REFERENCES stations(id) ON DELETE SET NULL,
+              program_id INTEGER NOT NULL REFERENCES programs(id),
+              region TEXT NOT NULL,
+              air_date TEXT NOT NULL,
+              actual_start TEXT NOT NULL,
+              authorized INTEGER NOT NULL CHECK(authorized IN (0,1)),
+              within_window INTEGER NOT NULL CHECK(within_window IN (0,1)),
+              source TEXT NOT NULL DEFAULT 'backhaul',
+              detail TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS backhaul_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              package_id INTEGER NOT NULL REFERENCES backhaul_packages(id) ON DELETE CASCADE,
+              event_type TEXT NOT NULL,
+              detail TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -171,6 +235,8 @@ class RadioDB:
             if not self.conn.execute("SELECT 1 FROM programs WHERE id=?", (program_id,)).fetchone():
                 raise DomainError("节目不存在")
             self.conn.execute("INSERT OR IGNORE INTO program_regions(program_id,region) VALUES(?,?)", (program_id, region.strip()))
+            # 授权改动：待核数据立即作废并按当前授权快照重算
+            self._recalculate_pending("授权改动：追加地区授权")
 
     def add_sponsor_policy(self, sponsor: str, min_gap_minutes: int) -> None:
         if not sponsor.strip() or min_gap_minutes < 0:
@@ -267,6 +333,8 @@ class RadioDB:
                 "INSERT INTO slots(air_date,start_time,duration_minutes,program_id,region,created_at) VALUES(?,?,?,?,?,?)",
                 (air_date, start_time, int(program["duration_minutes"]), program_id, region, datetime.now().isoformat()),
             )
+            # 编排改动：待核数据立即作废并按当前节目单重算
+            self._recalculate_pending("编排改动：新增排期")
         return int(cur.lastrowid)
 
     def replace_slot(self, slot_id: int, new_program_id: int) -> dict:
@@ -283,6 +351,8 @@ class RadioDB:
                 "UPDATE slots SET program_id=?, duration_minutes=?, replaced_from=?, status='replaced' WHERE id=?",
                 (new_program_id, int(program["duration_minutes"]), slot["program_id"], slot_id),
             )
+            # 编排改动：待核数据立即作废并按当前节目单重算
+            self._recalculate_pending("编排改动：替换排期")
         return self.get_slot(slot_id)
 
     def get_slot(self, slot_id: int) -> dict:
@@ -339,11 +409,23 @@ class RadioDB:
                     "SELECT p.* FROM programs p WHERE p.id=?", (actual_program_id,)
                 ).fetchone()
                 if actual:
-                    region_ok = self.conn.execute(
-                        "SELECT 1 FROM program_regions WHERE program_id=? AND region=?", (actual_program_id, slot["region"])
+                    # 已播段按播出时刻的授权快照判越权，不拿后来窗口追溯
+                    snapshot = self.conn.execute(
+                        "SELECT asnap.* FROM authorization_snapshots asnap "
+                        "JOIN backhaul_segments bs ON bs.snapshot_id=asnap.id "
+                        "WHERE bs.playout_log_id=? ORDER BY asnap.id DESC LIMIT 1",
+                        (log["id"],),
                     ).fetchone()
-                    if not region_ok or not (actual["start_date"] <= air_date <= actual["end_date"]):
-                        exceptions.append((slot["id"], "out_of_license", "实播节目超出地区或日期授权"))
+                    if snapshot:
+                        if not snapshot["authorized"] or not snapshot["within_window"]:
+                            exceptions.append((slot["id"], "out_of_license",
+                                                f"实播节目在播出时刻未授权（授权快照判定）：{snapshot['detail']}"))
+                    else:
+                        region_ok = self.conn.execute(
+                            "SELECT 1 FROM program_regions WHERE program_id=? AND region=?", (actual_program_id, slot["region"])
+                        ).fetchone()
+                        if not region_ok or not (actual["start_date"] <= air_date <= actual["end_date"]):
+                            exceptions.append((slot["id"], "out_of_license", "实播节目超出地区或日期授权"))
             for slot_id, kind, detail in exceptions:
                 self.conn.execute(
                     "INSERT INTO reconciliation_exceptions(air_date,slot_id,kind,detail,created_at) VALUES(?,?,?,?,?)",
@@ -355,6 +437,336 @@ class RadioDB:
         return [dict(row) for row in self.conn.execute(
             "SELECT * FROM reconciliation_exceptions WHERE air_date=? ORDER BY slot_id, kind", (air_date,)
         ).fetchall()]
+
+    # ------------------------------------------------------------------
+    # 发射台与离线回传批次
+    # ------------------------------------------------------------------
+
+    def add_station(self, code: str, name: str) -> int:
+        if not code.strip() or not name.strip():
+            raise DomainError("发射台编号和名称不能为空")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO stations(code,name,created_at) VALUES(?,?,?)",
+                    (code.strip(), name.strip(), datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError(f"发射台编号已存在: {code}") from exc
+        return int(cur.lastrowid)
+
+    def list_stations(self) -> list[dict]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT s.*, (SELECT COUNT(*) FROM backhaul_packages bp WHERE bp.station_id=s.id) AS package_count "
+            "FROM stations s ORDER BY s.code"
+        ).fetchall()]
+
+    def receive_backhaul(self, station_code: str, package_no: str, segments: list[dict]) -> dict:
+        """Receive an offline backhaul batch.
+
+        Each station is accepted once per package number. A retry only
+        re-processes segments that have not been posted yet; segments that
+        already produced a playout log are never duplicated. Validation
+        failures keep the package in 'pending' (待核).
+        """
+        if not station_code.strip():
+            raise DomainError("发射台编号不能为空")
+        if not package_no.strip():
+            raise DomainError("包号不能为空")
+        if not segments:
+            raise DomainError("回传批次不能为空")
+        station = self.conn.execute(
+            "SELECT * FROM stations WHERE code=?", (station_code.strip(),)
+        ).fetchone()
+        if not station:
+            raise DomainError(f"发射台不存在: {station_code}")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            pkg = self.conn.execute(
+                "SELECT * FROM backhaul_packages WHERE station_id=? AND package_no=?",
+                (station["id"], package_no.strip()),
+            ).fetchone()
+            is_retry = pkg is not None
+            if not pkg:
+                cur = self.conn.execute(
+                    "INSERT INTO backhaul_packages(station_id,package_no,status,total_segments,received_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (station["id"], package_no.strip(), "pending", len(segments), now, now),
+                )
+                pkg = self.conn.execute(
+                    "SELECT * FROM backhaul_packages WHERE id=?", (cur.lastrowid,)
+                ).fetchone()
+            for idx, seg in enumerate(segments, start=1):
+                seg_no = int(seg.get("segment_no") or idx)
+                if is_retry:
+                    existing = self.conn.execute(
+                        "SELECT * FROM backhaul_segments WHERE package_id=? AND segment_no=?",
+                        (pkg["id"], seg_no),
+                    ).fetchone()
+                    if existing and existing["playout_log_id"] is not None:
+                        # 已入账的实播不重复新增
+                        continue
+                self._validate_and_post_segment(pkg, seg_no, seg, station["id"], now)
+            self.conn.execute(
+                "INSERT INTO backhaul_events(package_id,event_type,detail,created_at) VALUES(?,?,?,?)",
+                (pkg["id"], "received" if not is_retry else "retried",
+                 f"提交 {len(segments)} 段", now),
+            )
+            self._refresh_package_status(pkg["id"])
+        return self.get_backhaul_package(pkg["id"])
+
+    def _validate_and_post_segment(self, pkg: sqlite3.Row, seg_no: int, seg: dict,
+                                   station_id: int, now: str) -> dict:
+        air_date = str(seg.get("air_date", ""))
+        start_time = str(seg.get("start_time", ""))
+        region = str(seg.get("region", "") or "").strip()
+        actual_start = str(seg.get("actual_start", ""))
+        actual_duration = seg.get("actual_duration_minutes")
+        actual_program_id = seg.get("actual_program_id")
+        try:
+            datetime.strptime(air_date, "%Y-%m-%d")
+        except ValueError:
+            return self._upsert_segment(pkg, seg_no, seg, "missing", "播出日期格式无效", None, None, now)
+        try:
+            _minutes(start_time)
+        except ValueError:
+            return self._upsert_segment(pkg, seg_no, seg, "missing", "开始时间格式无效", None, None, now)
+        try:
+            _minutes(actual_start)
+        except ValueError:
+            return self._upsert_segment(pkg, seg_no, seg, "missing", "实际开始时间格式无效", None, None, now)
+        try:
+            duration = int(actual_duration)
+        except (TypeError, ValueError):
+            return self._upsert_segment(pkg, seg_no, seg, "missing", "实际时长格式无效", None, None, now)
+        if duration < 0:
+            return self._upsert_segment(pkg, seg_no, seg, "missing", "实际时长不能为负数", None, None, now)
+        # 按当前节目单匹配排期
+        slot = None
+        if region:
+            slot = self.conn.execute(
+                "SELECT * FROM slots WHERE air_date=? AND start_time=? AND region=? AND status!='cancelled' LIMIT 1",
+                (air_date, start_time, region),
+            ).fetchone()
+        else:
+            candidates = self.conn.execute(
+                "SELECT * FROM slots WHERE air_date=? AND start_time=? AND status!='cancelled'",
+                (air_date, start_time),
+            ).fetchall()
+            if len(candidates) == 1:
+                slot = candidates[0]
+                region = str(slot["region"])
+            elif len(candidates) > 1:
+                return self._upsert_segment(pkg, seg_no, seg, "missing",
+                                            "该时间有多个排期，请指定地区", None, None, now)
+        if not slot:
+            return self._upsert_segment(pkg, seg_no, seg, "missing",
+                                        "当前节目单中找不到对应排期", None, None, now)
+        region = str(slot["region"])
+        program_id: int | None = None
+        if actual_program_id:
+            try:
+                program_id = int(actual_program_id)
+            except (TypeError, ValueError):
+                program_id = None
+        if not program_id:
+            return self._upsert_segment(pkg, seg_no, seg, "pending", "缺少实播节目", slot["id"], None, now, region=region)
+        program = self.conn.execute(
+            "SELECT * FROM programs WHERE id=?", (program_id,)
+        ).fetchone()
+        if not program:
+            return self._upsert_segment(pkg, seg_no, seg, "pending", "实播节目不存在", slot["id"], None, now, region=region)
+        # 授权快照在播出时刻冻结，之后窗口变化不追溯
+        region_ok = self.conn.execute(
+            "SELECT 1 FROM program_regions WHERE program_id=? AND region=?", (program["id"], region)
+        ).fetchone()
+        within_window = program["start_date"] <= air_date <= program["end_date"]
+        authorized = 1 if (region_ok and within_window) else 0
+        parts: list[str] = []
+        if not region_ok:
+            parts.append(f"未授权地区 {region}")
+        if not within_window:
+            parts.append("超出授权日期窗口")
+        detail = "；".join(parts) if parts else f"授权地区 {region} 且在授权窗口内"
+        cur = self.conn.execute(
+            "INSERT INTO authorization_snapshots"
+            "(station_id,program_id,region,air_date,actual_start,authorized,within_window,source,detail,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (station_id, program["id"], region, air_date, actual_start, authorized,
+             1 if within_window else 0, "backhaul", detail, now),
+        )
+        snapshot_id = int(cur.lastrowid)
+        # 段已播出，实播入账（已入账的不会重复新增）
+        cur = self.conn.execute(
+            "INSERT INTO playout_logs(slot_id,actual_start,actual_duration_minutes,actual_program_id,note,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (slot["id"], actual_start, duration, program["id"],
+             f"离线回传包 {pkg['package_no']} 段 {seg_no}", now),
+        )
+        log_id = int(cur.lastrowid)
+        status = "accepted" if authorized else "pending"
+        fail_reason = None if authorized else f"实播节目在播出时刻未授权：{detail}"
+        return self._upsert_segment(pkg, seg_no, seg, status, fail_reason, slot["id"], log_id, now,
+                                    snapshot_id=snapshot_id, region=region)
+
+    def _upsert_segment(self, pkg: sqlite3.Row, seg_no: int, seg: dict, status: str,
+                        fail_reason: str | None, slot_id: int | None, log_id: int | None,
+                        now: str, snapshot_id: int | None = None, region: str | None = None) -> dict:
+        air_date = str(seg.get("air_date", ""))
+        start_time = str(seg.get("start_time", ""))
+        region = region if region is not None else str(seg.get("region", "") or "")
+        actual_start = str(seg.get("actual_start", "") or "")
+        try:
+            actual_duration = int(seg.get("actual_duration_minutes")) if seg.get("actual_duration_minutes") is not None else None
+        except (TypeError, ValueError):
+            actual_duration = None
+        try:
+            actual_program_id = int(seg.get("actual_program_id")) if seg.get("actual_program_id") else None
+        except (TypeError, ValueError):
+            actual_program_id = None
+        existing = self.conn.execute(
+            "SELECT id FROM backhaul_segments WHERE package_id=? AND segment_no=?", (pkg["id"], seg_no)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "UPDATE backhaul_segments SET slot_id=?,air_date=?,start_time=?,region=?,actual_start=?,"
+                "actual_duration_minutes=?,actual_program_id=?,status=?,fail_reason=?,playout_log_id=?,"
+                "snapshot_id=?,updated_at=? WHERE id=?",
+                (slot_id, air_date, start_time, region, actual_start, actual_duration,
+                 actual_program_id, status, fail_reason, log_id, snapshot_id, now, existing["id"]),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO backhaul_segments(package_id,segment_no,slot_id,air_date,start_time,region,"
+                "actual_start,actual_duration_minutes,actual_program_id,status,fail_reason,playout_log_id,"
+                "snapshot_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pkg["id"], seg_no, slot_id, air_date, start_time, region, actual_start,
+                 actual_duration, actual_program_id, status, fail_reason, log_id, snapshot_id, now, now),
+            )
+        return {"segment_no": seg_no, "status": status, "fail_reason": fail_reason,
+                "playout_log_id": log_id, "snapshot_id": snapshot_id}
+
+    def _refresh_package_status(self, pkg_id: int) -> None:
+        counts = self.conn.execute(
+            "SELECT status, COUNT(*) AS n FROM backhaul_segments WHERE package_id=? GROUP BY status",
+            (pkg_id,),
+        ).fetchall()
+        d = {str(r["status"]): int(r["n"]) for r in counts}
+        total = sum(d.values())
+        accepted = d.get("accepted", 0)
+        status = "accepted" if total > 0 and accepted == total else "pending"
+        self.conn.execute(
+            "UPDATE backhaul_packages SET status=?,total_segments=?,accepted_segments=?,"
+            "pending_segments=?,missing_segments=?,updated_at=? WHERE id=?",
+            (status, total, accepted, d.get("pending", 0), d.get("missing", 0),
+             datetime.now().isoformat(), pkg_id),
+        )
+
+    def recalculate_pending_backhaul(self, reason: str = "编排改动") -> dict:
+        """Void pending packages and recalculate them against the current playlist.
+
+        Already-posted segments keep their frozen authorization snapshot; only
+        segments that were never posted are re-evaluated against the current
+        playlist and authorization state.
+        """
+        with self.transaction():
+            return self._recalculate_pending(reason)
+
+    def _recalculate_pending(self, reason: str) -> dict:
+        now = datetime.now().isoformat()
+        pkgs = self.conn.execute(
+            "SELECT * FROM backhaul_packages WHERE status='pending' ORDER BY id"
+        ).fetchall()
+        voided = 0
+        resolved = 0
+        for pkg in pkgs:
+            self.conn.execute(
+                "UPDATE backhaul_packages SET status='void',void_reason=?,voided_at=?,"
+                "recalc_round=recalc_round+1,updated_at=? WHERE id=?",
+                (reason, now, now, pkg["id"]),
+            )
+            self.conn.execute(
+                "INSERT INTO backhaul_events(package_id,event_type,detail,created_at) VALUES(?,?,?,?)",
+                (pkg["id"], "voided", f"待核数据作废：{reason}", now),
+            )
+            voided += 1
+            segs = self.conn.execute(
+                "SELECT * FROM backhaul_segments WHERE package_id=? AND playout_log_id IS NULL ORDER BY segment_no",
+                (pkg["id"],),
+            ).fetchall()
+            for seg in segs:
+                result = self._validate_and_post_segment(
+                    pkg, int(seg["segment_no"]), self._seg_dict(seg), int(pkg["station_id"]), now,
+                )
+                if result["status"] == "accepted":
+                    resolved += 1
+            self.conn.execute(
+                "INSERT INTO backhaul_events(package_id,event_type,detail,created_at) VALUES(?,?,?,?)",
+                (pkg["id"], "recalculated",
+                 f"按当前节目单和授权快照重算，{len(segs)} 段待处理，{resolved} 段转已入账", now),
+            )
+            self._refresh_package_status(pkg["id"])
+        return {"voided_packages": voided, "resolved_segments": resolved}
+
+    @staticmethod
+    def _seg_dict(seg: sqlite3.Row) -> dict:
+        return {
+            "air_date": seg["air_date"],
+            "start_time": seg["start_time"],
+            "region": seg["region"],
+            "actual_start": seg["actual_start"],
+            "actual_duration_minutes": seg["actual_duration_minutes"],
+            "actual_program_id": seg["actual_program_id"],
+        }
+
+    def get_backhaul_package(self, package_id: int) -> dict:
+        pkg = self.conn.execute(
+            "SELECT bp.*, s.code AS station_code, s.name AS station_name "
+            "FROM backhaul_packages bp JOIN stations s ON s.id=bp.station_id WHERE bp.id=?",
+            (package_id,),
+        ).fetchone()
+        if not pkg:
+            raise DomainError("回传批次不存在")
+        segments = [dict(r) for r in self.conn.execute(
+            "SELECT bs.*, al.title AS actual_title FROM backhaul_segments bs "
+            "LEFT JOIN programs al ON al.id=bs.actual_program_id "
+            "WHERE bs.package_id=? ORDER BY bs.segment_no",
+            (package_id,),
+        ).fetchall()]
+        events = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM backhaul_events WHERE package_id=? ORDER BY id", (package_id,)
+        ).fetchall()]
+        return {"package": dict(pkg), "segments": segments, "events": events}
+
+    def list_backhaul_packages(self, station_code: str | None = None,
+                               status: str | None = None) -> list[dict]:
+        sql = ("SELECT bp.*, s.code AS station_code, s.name AS station_name "
+               "FROM backhaul_packages bp JOIN stations s ON s.id=bp.station_id WHERE 1=1")
+        params: list[object] = []
+        if station_code:
+            sql += " AND s.code=?"
+            params.append(station_code.strip())
+        if status:
+            sql += " AND bp.status=?"
+            params.append(status)
+        sql += " ORDER BY bp.id DESC"
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def get_authorization_snapshots(self, air_date: str | None = None,
+                                     station_code: str | None = None) -> list[dict]:
+        sql = ("SELECT asnap.*, s.code AS station_code, p.title AS program_title "
+               "FROM authorization_snapshots asnap "
+               "LEFT JOIN stations s ON s.id=asnap.station_id "
+               "JOIN programs p ON p.id=asnap.program_id WHERE 1=1")
+        params: list[object] = []
+        if air_date:
+            sql += " AND asnap.air_date=?"
+            params.append(air_date)
+        if station_code:
+            sql += " AND s.code=?"
+            params.append(station_code.strip())
+        sql += " ORDER BY asnap.id"
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     def snapshot(self) -> dict:
         programs = [dict(row) for row in self.conn.execute("SELECT * FROM programs ORDER BY id").fetchall()]

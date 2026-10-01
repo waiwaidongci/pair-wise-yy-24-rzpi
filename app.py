@@ -41,6 +41,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        parts = [p for p in parsed.path.split("/") if p]
         try:
             if parsed.path in ("/", "/index.html"):
                 data = (BASE / "static" / "index.html").read_bytes()
@@ -57,6 +58,22 @@ class Handler(BaseHTTPRequestHandler):
                 if not date:
                     raise DomainError("缺少 date 参数")
                 return self._json(200, {"exceptions": self.db.get_exceptions(date)})
+            if parsed.path == "/api/stations":
+                return self._json(200, {"stations": self.db.list_stations()})
+            if parsed.path == "/api/backhaul":
+                qs = parse_qs(parsed.query)
+                return self._json(200, {"packages": self.db.list_backhaul_packages(
+                    qs.get("station_code", [""])[0] or None,
+                    qs.get("status", [""])[0] or None,
+                )})
+            if parsed.path == "/api/authorization-snapshots":
+                qs = parse_qs(parsed.query)
+                return self._json(200, {"snapshots": self.db.get_authorization_snapshots(
+                    qs.get("air_date", [""])[0] or None,
+                    qs.get("station_code", [""])[0] or None,
+                )})
+            if len(parts) == 3 and parts[:2] == ["api", "backhaul"] and parts[2].isdigit():
+                return self._json(200, self.db.get_backhaul_package(int(parts[2])))
             self._json(404, {"ok": False, "error": "接口不存在"})
         except DomainError as exc:
             self._json(400, {"ok": False, "error": str(exc)})
@@ -90,6 +107,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": log_id})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
+            if parsed.path == "/api/stations":
+                station_id = self.db.add_station(str(body.get("code", "")), str(body.get("name", "")))
+                return self._json(201, {"ok": True, "id": station_id})
+            if parsed.path == "/api/backhaul":
+                result = self.db.receive_backhaul(
+                    str(body.get("station_code", "")), str(body.get("package_no", "")),
+                    body.get("segments") or [],
+                )
+                return self._json(201, {"ok": True, **result})
+            if parsed.path == "/api/backhaul/recalculate":
+                return self._json(200, {"ok": True,
+                                        "recalculated": self.db.recalculate_pending_backhaul(str(body.get("reason", "编排改动")))})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":
