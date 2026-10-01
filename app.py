@@ -57,6 +57,25 @@ class Handler(BaseHTTPRequestHandler):
                 if not date:
                     raise DomainError("缺少 date 参数")
                 return self._json(200, {"exceptions": self.db.get_exceptions(date)})
+            if parsed.path == "/api/license":
+                date = parse_qs(parsed.query).get("date", [""])[0]
+                if not date:
+                    raise DomainError("缺少 date 参数")
+                return self._json(200, {"playouts": self.db.playout_license_view(date)})
+            if parsed.path == "/api/ingest/batches":
+                qs = parse_qs(parsed.query)
+                station = qs.get("station", [""])[0]
+                return self._json(200, {"batches": self.db.list_batches(station or None)})
+            if parsed.path == "/api/ingest/batch":
+                qs = parse_qs(parsed.query)
+                station = qs.get("station", [""])[0]
+                package = qs.get("package", [""])[0]
+                if not station or not package:
+                    raise DomainError("缺少 station 或 package 参数")
+                return self._json(200, {"batch": self.db.get_batch(station, package)})
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "auth-snapshots"]:
+                return self._json(200, {"snapshot": self.db.get_snapshot(int(parts[2]))})
             self._json(404, {"ok": False, "error": "接口不存在"})
         except DomainError as exc:
             self._json(400, {"ok": False, "error": str(exc)})
@@ -90,6 +109,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": log_id})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
+            if parsed.path == "/api/ingest/batches":
+                summary = self.db.receive_batch(
+                    str(body.get("station_code", "")), str(body.get("package_no", "")),
+                    body.get("segments") or [], body.get("segment_count"),
+                    body.get("manifest"), body.get("auth_snapshot"), str(body.get("station_name", "")),
+                )
+                return self._json(200, {"ok": True, "batch": summary})
+            if parsed.path == "/api/programs/deauthorize-region":
+                self.db.deauthorize_region(int(body.get("program_id", 0)), str(body.get("region", "")))
+                return self._json(200, {"ok": True})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":
